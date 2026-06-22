@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cellpose-tools"
+version = "0.1.0"
+description = "Utilities and CLI for Cellpose-based image processing"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "University of Chicago"}
+authors = [{name="Rui Fu", email="ruiff@uchicago.com"}]
+
+dependencies = [
+  "typer>=0.12",
+  "numpy>=1.23",
+  "cellpose>=3.0",
+  "matplotlib>=3.6",
+  "scipy>=1.10",
+  "pandas>=2.0",
+  "openpyxl>=3.1",
+  "scikit-image>=0.21",        # 提供 skimage.* 与 restoration.rolling_ball
+  "readlif>=0.6",
+  "tifffile>=2023.7.10",
+  "opencv-python-headless>=4.8",
+]
+
+[project.optional-dependencies]
+gui = ["opencv-python>=4.8"]   # 需要 GUI 时安装：pip install "cellpose-tools[gui]"
+dev = ["pytest>=8", "ruff>=0.5", "mypy>=1.10", "build>=1.2"]
+
+[project.scripts]
+cellpose-tools = "cellpose_tools.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cellpose_tools"]
