@@ -1,0 +1,340 @@
+--- /mnt/data/core(2).py	2026-04-20 22:21:10.260041548 +0000
++++ /mnt/data/core_ratio_patched.py	2026-04-20 22:33:14.138713978 +0000
+@@ -146,21 +146,41 @@
+ # -----------------------------
+ # Statistics / export
+ # -----------------------------
+-def get_area(band: np.ndarray) -> int:
+-    """Number of pixels in band region."""
+-    return int(np.count_nonzero(band))
++def get_area(mask: np.ndarray) -> int:
++    """Number of non-zero pixels in a binary region mask."""
++    return int(np.count_nonzero(mask))
+ 
+ 
+-def get_density(img: np.ndarray, band: np.ndarray) -> float:
++def get_intensity_readout(img: np.ndarray, region_mask: np.ndarray, average: bool = True) -> float:
+     """
+-    Mean intensity within the band region: sum(img * band) / area(band).
+-    `band` should be a 0/1 mask. If area=0, return 0.0 to avoid division by zero.
++    Compute intensity readout inside a binary region.
++
++    Args:
++        img: intensity image
++        region_mask: 0/1 mask defining the measurement region
++        average: if True, return mean intensity; if False, return total intensity
++
++    Returns:
++        Mean or total intensity inside `region_mask`. Returns 0.0 for empty masks.
+     """
+-    area = get_area(band)
++    area = get_area(region_mask)
+     if area == 0:
+         return 0.0
+-    band_intensity = float(np.sum(img * band))
+-    return band_intensity / area
++
++    total_intensity = float(np.sum(img * region_mask))
++    return total_intensity / area if average else total_intensity
++
++
++def summarize_region_metrics(img: np.ndarray, region_mask: np.ndarray) -> Dict[str, float]:
++    """Return total, area, and average intensity for a binary region mask."""
++    area = get_area(region_mask)
++    total = float(np.sum(img * region_mask)) if area > 0 else 0.0
++    average = (total / area) if area > 0 else 0.0
++    return {
++        "total": total,
++        "area": int(area),
++        "average": average,
++    }
+ 
+ 
+ def lst_to_excel(lst: List[float], filename: str, column_name: str = "New_Column") -> None:
+@@ -382,6 +402,8 @@
+     band_erosion: int = 1,
+     output_name: str = "output",
+     rb_radius: Optional[int] = None,
++    ratio_mode: Literal["off", "average", "total"] = "off",
++    membrane_in_numerator: bool = True,
+     # saving controls
+     save_seg: Literal["none","repr","all"] = "repr",
+     save_band: Literal["none","repr","all"] = "repr",
+@@ -395,15 +417,29 @@
+ ) -> pd.DataFrame:
+     """
+     Read a TIFF (timelapse + z-stack capable), normalize to (T,Z,Y,X,C),
+-    optionally keep/ignore T/Z, run Cellpose per (t,z), compute band-intensity
+-    per cell, save overlays per options, and write Excel with:
+-      - per_cell: t, z, cell_id, density
+-      - summary : full T×Z grid, including empty frames (n_cells=0)
++    optionally keep/ignore T/Z, run Cellpose per (t,z), compute membrane and
++    total fluorescence metrics for every cell, optionally compute a ratio, save
++    overlays, and write Excel.
++
++    Per-cell outputs always include:
++      1) membrane_total
++      2) membrane_area
++      3) membrane_average
++      4) total_total
++      5) total_area
++      6) total_average
++      7) ratio (optional; based on average or total, as requested)
++
++    Ratio options:
++      - ratio_mode="off"     : do not compute ratio
++      - ratio_mode="average" : membrane_average / total_average (or flipped)
++      - ratio_mode="total"   : membrane_total / total_total (or flipped)
++
++    The numerator defaults to membrane. Set membrane_in_numerator=False to flip.
+ 
+     Returns:
+         per_cell_df: pd.DataFrame
+     """
+-    # --- read & normalize axes early ---
+     with tiff.TiffFile(path) as tif:
+         series = tif.series[0]
+         raw_axes = getattr(series, "axes", None)
+@@ -412,7 +448,6 @@
+     arr_norm, _ = _normalize_to_TZYCX(arr, raw_axes)
+     T, Z, Y, X, C = arr_norm.shape
+ 
+-    # --- optionally collapse T/Z (but keep analysis grid consistent) ---
+     if not use_time:
+         arr_norm = arr_norm[:1, ...]
+         T = 1
+@@ -429,14 +464,15 @@
+             raise ValueError(f"Specified channel={ch} exceeds available channels {C}")
+         return frame[..., ch]
+ 
+-    # --- prepare Cellpose model ---
++    if ratio_mode not in {"off", "average", "total"}:
++        raise ValueError(f"Unsupported ratio_mode={ratio_mode!r}. Use 'off', 'average', or 'total'.")
++
+     model = models.Cellpose(gpu=False, model_type=model_type)
+-    channels = [0, 0]  # grayscale
++    channels = [0, 0]
+ 
+     per_cell_rows = []
+-    best = {"density": -np.inf, "t": None, "z": None, "img": None, "band": None, "masks": None, "flows": None}
++    best = {"score": -np.inf, "t": None, "z": None, "img": None, "region": None, "masks": None, "flows": None}
+ 
+-    # --- iterate over (t,z) ---
+     for t_idx in range(T):
+         for z_idx in range(Z):
+             seg_img = select_channel(arr_norm[t_idx, z_idx], seg_channel).astype(np.float32)
+@@ -453,63 +489,135 @@
+             labels = labels[labels != 0]
+ 
+             if labels.size == 0:
+-                per_cell_rows.append({"t": t_idx, "z": z_idx, "cell_id": None, "density": np.nan})
++                per_cell_rows.append({
++                    "t": t_idx,
++                    "z": z_idx,
++                    "cell_id": None,
++                    "membrane_total": np.nan,
++                    "membrane_area": np.nan,
++                    "membrane_average": np.nan,
++                    "total_total": np.nan,
++                    "total_area": np.nan,
++                    "total_average": np.nan,
++                    "ratio": np.nan,
++                    "ratio_mode": ratio_mode,
++                    "ratio_numerator": "membrane" if membrane_in_numerator else "total",
++                    "ratio_denominator": "total" if membrane_in_numerator else "membrane",
++                    "ratio_metric": None if ratio_mode == "off" else ratio_mode,
++                })
+                 continue
+ 
+-            density_list, band_list = [], []
++            ratio_values = []
++            membrane_regions = []
+             for lab in labels:
+                 single = (masks == lab).astype(np.uint8)
+-                band = create_band(single, dilation=band_dilation, erosion=band_erosion)
+-                dens = get_density(measure_img, band)
+-                per_cell_rows.append({"t": t_idx, "z": z_idx, "cell_id": int(lab), "density": float(dens)})
+-                density_list.append(float(dens))
+-                band_list.append(band)
+-
+-            # update representative
+-            kmax = int(np.argmax(density_list))
+-            if density_list[kmax] > best["density"]:
+-                best.update({
+-                    "density": density_list[kmax],
+-                    "t": t_idx, "z": z_idx,
+-                    "img": seg_img,
+-                    "band": band_list[kmax],
+-                    "masks": masks,
+-                    "flows": flows,
+-                })
++                membrane_mask = create_band(single, dilation=band_dilation, erosion=band_erosion)
++                total_mask = single
++
++                membrane_metrics = summarize_region_metrics(measure_img, membrane_mask)
++                total_metrics = summarize_region_metrics(measure_img, total_mask)
++
++                if ratio_mode == "average":
++                    numerator = membrane_metrics["average"] if membrane_in_numerator else total_metrics["average"]
++                    denominator = total_metrics["average"] if membrane_in_numerator else membrane_metrics["average"]
++                elif ratio_mode == "total":
++                    numerator = membrane_metrics["total"] if membrane_in_numerator else total_metrics["total"]
++                    denominator = total_metrics["total"] if membrane_in_numerator else membrane_metrics["total"]
++                else:
++                    numerator = denominator = None
++
++                ratio_value = float(numerator / denominator) if (ratio_mode != "off" and denominator not in (None, 0)) else np.nan
++
++                row = {
++                    "t": t_idx,
++                    "z": z_idx,
++                    "cell_id": int(lab),
++                    "membrane_total": float(membrane_metrics["total"]),
++                    "membrane_area": int(membrane_metrics["area"]),
++                    "membrane_average": float(membrane_metrics["average"]),
++                    "total_total": float(total_metrics["total"]),
++                    "total_area": int(total_metrics["area"]),
++                    "total_average": float(total_metrics["average"]),
++                    "ratio": ratio_value,
++                    "ratio_mode": ratio_mode,
++                    "ratio_numerator": "membrane" if membrane_in_numerator else "total",
++                    "ratio_denominator": "total" if membrane_in_numerator else "membrane",
++                    "ratio_metric": None if ratio_mode == "off" else ratio_mode,
++                }
++                per_cell_rows.append(row)
++                ratio_values.append(ratio_value)
++                membrane_regions.append(membrane_mask)
++
++                if ratio_mode == "average":
++                    overlay_score = row["membrane_average"]
++                elif ratio_mode == "total":
++                    overlay_score = row["membrane_total"]
++                else:
++                    overlay_score = row["membrane_average"]
++
++                if overlay_score > best["score"]:
++                    best.update({
++                        "score": overlay_score,
++                        "t": t_idx,
++                        "z": z_idx,
++                        "img": seg_img,
++                        "region": membrane_mask,
++                        "masks": masks,
++                        "flows": flows,
++                    })
+ 
+-            # save all frames overlays?
+             if (t_idx % stride_t == 0) and (z_idx % stride_z == 0):
+                 if save_seg == "all":
+                     fig = plt.figure(figsize=(8, 8))
+                     plot.show_segmentation(fig, seg_img, masks, flows[0], channels=channels)
+                     fig.savefig(f"{output_name}_seg_t{t_idx:03d}_z{z_idx:03d}.png", dpi=200, bbox_inches="tight")
+                     plt.close(fig)
+-                if save_band == "all":
++                if save_band == "all" and membrane_regions:
++                    kmax = int(np.nanargmax([r if np.isfinite(r) else -np.inf for r in ratio_values])) if ratio_mode != "off" and np.isfinite(np.nanmax(ratio_values)) else 0
+                     fig, ax = plt.subplots(figsize=(8, 8))
+                     ax.imshow(seg_img, cmap="gray")
+-                    masked = np.ma.masked_where(band_list[kmax] == 0, band_list[kmax])
++                    masked = np.ma.masked_where(membrane_regions[kmax] == 0, membrane_regions[kmax])
+                     ax.imshow(masked, cmap="viridis_r", alpha=0.5)
+                     ax.set_axis_off()
+                     fig.savefig(f"{output_name}_band_t{t_idx:03d}_z{z_idx:03d}.png", dpi=200, bbox_inches="tight")
+                     plt.close(fig)
+ 
+-    # --- build DataFrames ---
+     per_cell_df = pd.DataFrame(per_cell_rows)
+ 
+-    # summary that preserves full T×Z grid (empty frames included)
++    if per_cell_df.empty:
++        per_cell_df = pd.DataFrame(columns=[
++            "t", "z", "cell_id",
++            "membrane_total", "membrane_area", "membrane_average",
++            "total_total", "total_area", "total_average",
++            "ratio", "ratio_mode", "ratio_numerator", "ratio_denominator", "ratio_metric",
++        ])
++
+     summary_df = (
+-        per_cell_df.groupby(["t", "z"], dropna=False)["density"]
+-        .agg(n_cells=lambda s: int(s.notna().sum()),
+-             mean="mean", median="median", std="std")
++        per_cell_df.groupby(["t", "z"], dropna=False)
++        .agg(
++            n_cells=("cell_id", lambda s: int(s.notna().sum())),
++            membrane_total_mean=("membrane_total", "mean"),
++            membrane_area_mean=("membrane_area", "mean"),
++            membrane_average_mean=("membrane_average", "mean"),
++            total_total_mean=("total_total", "mean"),
++            total_area_mean=("total_area", "mean"),
++            total_average_mean=("total_average", "mean"),
++            ratio_mean=("ratio", "mean"),
++            ratio_median=("ratio", "median"),
++            ratio_std=("ratio", "std"),
++        )
+         .reset_index()
+     )
+     full_index = pd.MultiIndex.from_product([range(T), range(Z)], names=["t", "z"])
+     full_df = full_index.to_frame(index=False)
+     summary_df = full_df.merge(summary_df, on=["t", "z"], how="left")
+     summary_df["n_cells"] = summary_df["n_cells"].fillna(0).astype(int)
++    summary_df["ratio_mode"] = ratio_mode
++    summary_df["ratio_numerator"] = "membrane" if membrane_in_numerator else "total"
++    summary_df["ratio_denominator"] = "total" if membrane_in_numerator else "membrane"
++    summary_df["ratio_metric"] = None if ratio_mode == "off" else ratio_mode
+     summary_df = summary_df.sort_values(["t", "z"], ignore_index=True)
+ 
+-    # --- write Excel with fallback writer ---
+     excel_out = f"{output_name}.xlsx"
+     try:
+         with pd.ExcelWriter(excel_out, engine="xlsxwriter") as w:
+@@ -520,7 +628,6 @@
+             per_cell_df.to_excel(w, sheet_name="per_cell", index=False)
+             summary_df.to_excel(w, sheet_name="summary", index=False)
+ 
+-    # --- representative overlays ---
+     if best["img"] is not None:
+         t_idx, z_idx = best["t"], best["z"]
+         if save_seg in ("repr", "all"):
+@@ -531,7 +638,7 @@
+         if save_band in ("repr", "all"):
+             fig, ax = plt.subplots(figsize=(8, 8))
+             ax.imshow(best["img"], cmap="gray")
+-            masked = np.ma.masked_where(best["band"] == 0, best["band"])
++            masked = np.ma.masked_where(best["region"] == 0, best["region"])
+             ax.imshow(masked, cmap="viridis_r", alpha=0.5)
+             ax.set_axis_off()
+             fig.savefig(f"{output_name}_band_repr_t{t_idx:03d}_z{z_idx:03d}.png", dpi=300, bbox_inches="tight")
+--- /mnt/data/cli(2).py	2026-04-20 22:21:10.392485535 +0000
++++ /mnt/data/cli_ratio_patched.py	2026-04-20 22:33:14.211258608 +0000
+@@ -86,6 +86,14 @@
+         None, "--rb-radius", "--rb_radius",
+         help="Rolling-ball radius (px); omit or 0/None to disable"
+     ),
++    ratio_mode: str = typer.Option(
++        "off", "--ratio-mode",
++        help='Ratio mode: "off", "average", or "total"'
++    ),
++    membrane_in_numerator: bool = typer.Option(
++        True, "--membrane-in-numerator/--membrane-in-denominator",
++        help="Put membrane readout in numerator (default) or denominator when computing ratio"
++    ),
+     # NEW: choose whether to analyze T and/or Z axes
+     use_time: bool = typer.Option(True, "--use-time/--no-use-time",
+                                   help="Keep/analyze the time (T) axis (default: on)"),
+@@ -142,6 +150,7 @@
+             "Params       : "
+             f"seg_channel={seg_channel}, measure_channel={measure_channel}, model={model}, diameter={diameter}, "
+             f"band_dilation={band_dilation}, band_erosion={band_erosion}, rb_radius={rb_radius}, "
++            f"ratio_mode={ratio_mode}, membrane_in_numerator={membrane_in_numerator}, "
+             f"use_time={use_time}, use_z={use_z}, save_seg={save_seg}, save_band={save_band}"
+         )
+         if resolved_log_file:
+@@ -158,6 +167,8 @@
+             band_erosion=band_erosion,
+             output_name=str(output_name),
+             rb_radius=rb_radius,
++            ratio_mode=ratio_mode,
++            membrane_in_numerator=membrane_in_numerator,
+             save_seg=save_seg,          # NEW
+             save_band=save_band,        # NEW
+             stride_t=stride_t,          # NEW
